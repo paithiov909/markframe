@@ -45,12 +45,14 @@ enum Command {
         #[command(flatten)]
         options: cli_management::DeleteOptions,
     },
+    /// Start the local visual review server.
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 3741)]
         port: u16,
     },
+    /// Upload an image to the server for review.
     Post {
         image: PathBuf,
         #[arg(long, default_value = "http://127.0.0.1:3741")]
