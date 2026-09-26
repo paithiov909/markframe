@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "makeframe",
+  "project_id": "0287620f-3c55-401a-ab7a-97b1397c73f9"
+}
