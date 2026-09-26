@@ -31,6 +31,28 @@ markframe post output.png --server http://127.0.0.1:8080
 
 Runtime data is stored in the platform application data directory (Linux: `$XDG_DATA_HOME/markframe`, or `~/.local/share/markframe`; macOS: `~/Library/Application Support/dev.markframe.Markframe`; Windows: the platform local application-data directory). `MARKFRAME_DATA_DIR=/path/to/data` overrides it, including for isolated tests. Only one server may use a data directory at a time. Images use generated UUID filenames; `state.json` stores metadata and annotations and is replaced atomically after each mutation. Stop the server before copying the directory for backup. A corrupt state file fails startup rather than silently discarding data.
 
+## Manage posted images
+
+```sh
+markframe list
+markframe list --json
+markframe delete IMAGE_ID --dry-run
+markframe delete IMAGE_ID ANOTHER_ID --yes
+markframe prune --older-than 7d --keep-last 20 --dry-run
+markframe prune --older-than 7d --keep-last 20 --yes
+markframe clear --yes
+```
+
+All management commands accept `--server URL` and `--json`. Deletion commands accept `--dry-run` (no changes) and `--yes` (skip confirmation). Otherwise they show the IDs and total image bytes and require typing `yes`; non-interactive deletion requires `--yes`. A selection with no targets succeeds without confirmation. JSON results go to stdout; prompts and diagnostics go to stderr. Missing explicitly requested IDs or cleanup failures produce a nonzero exit status, with successful deletions still reported.
+
+`delete` requires full image IDs. `prune` requires at least one of `--older-than` (positive integer plus `h`, `d`, or `w`) and `--keep-last` (nonnegative integer). Combined conditions use AND: an image must be older than the duration and outside the newest N images. Exact age boundaries are retained. Annotated images are protected unless `--include-annotated` is specified; even empty rectangle annotations count. The latest N are counted across all images. Browser selection does not protect an image. `clear` deletes all posts, including annotated ones.
+
+Deletion permanently removes Markframe's image copy, metadata and annotations. It never touches the file passed to `post`, or resets settings. There is no undo. Confirmation fixes the maximum set of IDs to delete: images posted while you confirm are excluded, and prune conditions and annotation protection are checked again at execution.
+
+Metadata removal and pending file deletions are saved together before removing image files. If cleanup fails, the API reports the post as deleted with pending cleanup; subsequent deletion operations and server startup retry only recorded pending files. `freed_bytes` includes successful retries from earlier deletions. Dry-runs never retry cleanup. An empty CLI operation without `--yes` performs no cleanup; use `clear --yes` to retry pending cleanup when there are no posts. Existing data directories need no migration.
+
+Open browsers refresh history on deletion. They keep the selected image if it survives, otherwise display the newest remaining image or the empty screen. Unsaved feedback on a deleted image is preserved in a recovery panel with **Copy recovered feedback** and **Discard recovered feedback**. The panel retains the original comment and annotation context until explicitly discarded, and warns before leaving the page; it does not persist across browser restarts. Reconnecting browsers also reconcile missed deletions.
+
 ## Browser workflow
 
 1. Start the server and open its URL.
@@ -56,7 +78,10 @@ curl http://127.0.0.1:3741/api/images/IMAGE_ID/annotations
 | --- | --- | --- |
 | GET | `/api/health` | `{"status":"ok"}` |
 | POST | `/api/images` | Multipart `image`, optional `name`; 201 image metadata |
-| GET | `/api/images` | `{"images":[...]}`, newest first |
+| GET | `/api/images` | `{"images":[...]}`, newest first; includes `annotation_count` and `size_bytes` |
+| DELETE | `/api/images/:id` | Delete one image; optional `?dry_run=true`; 200 report or 404 |
+| POST | `/api/images/prune` | JSON selection conditions; 200 report |
+| DELETE | `/api/images` | JSON `{"all":true}` required; 200 report |
 | GET | `/api/current` | `{"image":{...}}`, or `{"image":null}` before any upload |
 | GET | `/api/images/:id/content` | Original bytes and detected content type |
 | GET | `/api/images/:id/annotations` | `{"image_id":"...","annotations":[...]}` |
@@ -65,9 +90,32 @@ curl http://127.0.0.1:3741/api/images/IMAGE_ID/annotations
 | PUT | `/api/images/:id/annotations/:aid` | Replace existing envelope; 200 |
 | DELETE | `/api/images/:id/annotations/:aid` | 204 |
 | GET | `/api/images/:id/annotations/:aid/preview` | Full-size PNG with a visible rectangle, no comment text |
-| GET | `/api/events` | SSE `event: image`, `data: {"id":"..."}` |
+| GET | `/api/events` | SSE `image` with `{"id":"..."}` or `images_deleted` with `{"ids":[...]}` |
 
 Image metadata contains `id`, sanitized `filename`, optional `name`, detected `mime_type`, intrinsic `width` and `height`, and RFC 3339 `created_at`. Image bytes are not rewritten. Uploads are limited to 25 MiB, 16,384 pixels per side and 32 megapixels, with a 256 MiB decoder allocation limit. Multipart overhead is limited to 64 KiB beyond the image limit. SVG, point annotations, and rotated rectangles are outside v0.1.
+
+Management requests and reports:
+
+```json
+{"older_than_seconds":604800,"keep_last":20,"include_annotated":false,"dry_run":true}
+```
+
+Use that body with `POST /api/images/prune`. At least one condition is required; `older_than_seconds` must be a positive integer no greater than 9223372036854775807. `DELETE /api/images` accepts `{"all":true,"dry_run":true}`; prune conditions are not allowed there. Both batch endpoints accept optional `candidate_ids`, restricting selection to those IDs (an empty array selects nothing). To confirm a preview, submit its `target_ids` as `candidate_ids` with `dry_run:false`. HTTP clients implement their own confirmation; `dry_run` defaults to false.
+
+```json
+{
+  "dry_run": false,
+  "target_ids": ["IMAGE_ID"],
+  "target_bytes": 12345,
+  "deleted_ids": ["IMAGE_ID"],
+  "protected_ids": [],
+  "missing_ids": [],
+  "freed_bytes": 12345,
+  "failures": []
+}
+```
+
+Dry-runs return selected IDs and bytes, with empty `deleted_ids` and zero `freed_bytes`. `protected_ids` contains otherwise eligible images excluded by annotation protection. `missing_ids` contains nonexistent candidate IDs. Cleanup failures contain `id` and `message` (an empty ID denotes failure to persist cleanup bookkeeping). A 200 report can contain cleanup failures: metadata deletion has already succeeded. Invalid conditions/IDs return 400, a missing individual image returns 404, and failure to save metadata returns 500 without deleting image files. SSE deletion notifications are sent after metadata removal, including when file cleanup remains pending. Reconcile against the image list on reconnect or an event without IDs.
 
 Annotation requests use native Annotorious v3 `ImageAnnotation` objects:
 

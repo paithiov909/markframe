@@ -25,6 +25,8 @@ pub struct Envelope {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub pending_deletions: Vec<String>,
     pub images: Vec<ImageMeta>,
     pub annotations: HashMap<String, Vec<Envelope>>,
 }
@@ -47,11 +49,20 @@ impl Storage {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Snapshot::default(),
             Err(e) => return Err(e),
         };
-        Ok(Self {
+        let mut store = Self {
             root,
             data,
             _lock: lock,
-        })
+        };
+        let result = store.cleanup();
+        for failure in result.failures {
+            tracing::warn!(
+                id = failure.id,
+                error = failure.message,
+                "Image cleanup pending"
+            );
+        }
+        Ok(store)
     }
     pub fn commit(&mut self, next: Snapshot) -> std::io::Result<()> {
         let bytes = serde_json::to_vec(&next)?;

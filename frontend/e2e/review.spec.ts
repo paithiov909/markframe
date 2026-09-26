@@ -267,3 +267,233 @@ test("a new post waits for an active rectangle gesture", async ({
       .annotations,
   ).toHaveLength(1);
 });
+
+async function postReviewImage(
+  request: import("@playwright/test").APIRequestContext,
+  name: string,
+) {
+  const response = await request.post("/api/images", {
+    multipart: { image: { name, mimeType: "image/png", buffer: fixture } },
+  });
+  expect(response.status()).toBe(201);
+  return response.json();
+}
+function seededAnnotation() {
+  return {
+    schema: "annotorious-v3",
+    annotation: {
+      id: "recovery-region",
+      bodies: [
+        {
+          id: "recovery-comment",
+          annotation: "recovery-region",
+          purpose: "commenting",
+          value: "Saved comment",
+        },
+      ],
+      target: {
+        annotation: "recovery-region",
+        selector: {
+          type: "RECTANGLE",
+          geometry: {
+            x: 100,
+            y: 100,
+            w: 160,
+            h: 100,
+            bounds: { minX: 100, minY: 100, maxX: 260, maxY: 200 },
+          },
+        },
+      },
+    },
+  };
+}
+
+test("external deletion keeps selection, falls back and clears the browser", async ({
+  page,
+  request,
+}) => {
+  await request.delete("/api/images", { data: { all: true } });
+  const first = await postReviewImage(request, "first.png");
+  const second = await postReviewImage(request, "second.png");
+  const third = await postReviewImage(request, "third.png");
+  await page.goto("/");
+  await expect(page.getByAltText("third.png")).toBeVisible();
+  await expect(page.getByRole("status", { name: "Save status" })).toHaveText(
+    "Saved",
+  );
+  await page.getByLabel("Image history").selectOption(first.id);
+  await expect(page.getByAltText("first.png")).toBeVisible();
+  await request.delete(`/api/images/${second.id}`);
+  await expect(page.getByLabel("Image history").locator("option")).toHaveCount(
+    3,
+  );
+  await expect(page.getByAltText("first.png")).toBeVisible();
+  await request.delete(`/api/images/${first.id}`);
+  await expect(page.getByAltText("third.png")).toBeVisible();
+  await expect(page.getByLabel("Image history")).toHaveValue(third.id);
+  await request.delete("/api/images", { data: { all: true } });
+  await expect(page.getByText("A place to look closer.")).toBeVisible();
+  await expect(page.getByLabel("Image history").locator("option")).toHaveCount(
+    1,
+  );
+});
+
+test("deletion recovers unsaved feedback and ignores a late save response", async ({
+  page,
+  request,
+}) => {
+  await request.delete("/api/images", { data: { all: true } });
+  await postReviewImage(request, "fallback.png");
+  const current = await postReviewImage(request, "draft.png");
+  const annotation = seededAnnotation();
+  await request.post(`/api/images/${current.id}/annotations`, {
+    data: annotation,
+  });
+  await page.goto("/");
+  await expect(page.getByRole("status", { name: "Save status" })).toHaveText(
+    "Saved",
+  );
+  const box = (await page.getByAltText("draft.png").boundingBox())!;
+  await page.mouse.click(box.x + 160, box.y + 150);
+  await expect(page.getByLabel("Selected annotation")).toHaveValue(
+    "Saved comment",
+  );
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started = false;
+  await page.route(
+    `**/api/images/${current.id}/annotations/recovery-region`,
+    async (route) => {
+      if (route.request().method() !== "PUT") return route.continue();
+      started = true;
+      await gate;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: route.request().postData()!,
+      });
+    },
+  );
+  const comment = "  未保存のコメント\nKeep exact whitespace  ";
+  await page.getByLabel("Selected annotation").fill(comment);
+  await expect.poll(() => started).toBe(true);
+  await request.delete(`/api/images/${current.id}`);
+  await expect(page.getByAltText("fallback.png")).toBeVisible();
+  const recovered = page.getByRole("region", { name: "Recovered drafts" });
+  await expect(recovered).toBeVisible();
+  await expect(recovered).toContainText(current.id);
+  await recovered
+    .getByRole("button", { name: "Copy recovered feedback" })
+    .click();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  expect(copied.startsWith(comment + "\n\n```json\n")).toBe(true);
+  expect(
+    JSON.parse(copied.slice(copied.indexOf("```json\n") + 8, -4)).image_id,
+  ).toBe(current.id);
+  release();
+  await expect(page.getByRole("status", { name: "Save status" })).toHaveText(
+    "Saved",
+  );
+  await expect(recovered).toBeVisible();
+  const prevented = await page.evaluate(() => {
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  expect(prevented).toBe(true);
+  await recovered
+    .getByRole("button", { name: "Discard recovered feedback" })
+    .click();
+  await expect(recovered).toHaveCount(0);
+  await expect(page.getByAltText("fallback.png")).toBeVisible();
+});
+
+test("reconnect reconciles missed deletion and annotation 404 does not delete an image", async ({
+  page,
+  request,
+}) => {
+  await request.delete("/api/images", { data: { all: true } });
+  const current = await postReviewImage(request, "reconnect.png");
+  await request.post(`/api/images/${current.id}/annotations`, {
+    data: seededAnnotation(),
+  });
+  // Chromium's offline emulation can leave an existing SSE socket alive.
+  // Keep real EventSource transport, but control disconnection/reconnection.
+  await page.addInitScript(() => {
+    const Native = window.EventSource;
+    class Reconnectable extends EventTarget {
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      source!: EventSource;
+      constructor(readonly url: string) {
+        super();
+        (window as unknown as { reviewEvents: Reconnectable }).reviewEvents =
+          this;
+        this.connect();
+      }
+      connect() {
+        this.source = new Native(this.url);
+        this.source.onopen = (event) => this.onopen?.(event);
+        this.source.onerror = (event) => this.onerror?.(event);
+        for (const type of ["image", "images_deleted"]) {
+          this.source.addEventListener(type, (event) =>
+            this.dispatchEvent(new MessageEvent(type, { data: event.data })),
+          );
+        }
+      }
+      close() {
+        this.source.close();
+      }
+      disconnect() {
+        this.close();
+        this.onerror?.(new Event("error"));
+      }
+    }
+    window.EventSource = Reconnectable as unknown as typeof EventSource;
+  });
+  await page.goto("/");
+  await expect(page.getByRole("status", { name: "Save status" })).toHaveText(
+    "Saved",
+  );
+  const box = (await page.getByAltText("reconnect.png").boundingBox())!;
+  await page.mouse.click(box.x + 160, box.y + 150);
+  await page.route("**/annotations/recovery-region", (route) =>
+    route.fulfill({
+      status: 404,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { message: "Annotation missing" } }),
+    }),
+  );
+  await page.getByLabel("Selected annotation").fill("Retain this after 404");
+  await expect(page.getByRole("status", { name: "Save status" })).toHaveText(
+    "Unsaved changes",
+  );
+  await expect(page.getByAltText("reconnect.png")).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Recovered drafts" }),
+  ).toHaveCount(0);
+  await page.evaluate(() =>
+    (
+      window as unknown as { reviewEvents: { disconnect: () => void } }
+    ).reviewEvents.disconnect(),
+  );
+  await expect(
+    page.getByRole("alert").filter({ hasText: "Connection interrupted" }),
+  ).toBeVisible();
+  await request.delete(`/api/images/${current.id}`);
+  await page.evaluate(() =>
+    (
+      window as unknown as { reviewEvents: { connect: () => void } }
+    ).reviewEvents.connect(),
+  );
+  await expect(page.getByText("A place to look closer.")).toBeVisible({
+    timeout: 15000,
+  });
+  const recovered = page.getByRole("region", { name: "Recovered drafts" });
+  await expect(recovered).toContainText("Retain this after 404");
+  await recovered
+    .getByRole("button", { name: "Discard recovered feedback" })
+    .click();
+});

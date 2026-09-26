@@ -2,7 +2,7 @@ use crate::storage::{Envelope, ImageMeta, Storage};
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Multipart, Path, State, multipart::MultipartRejection,
+        DefaultBodyLimit, Multipart, Path, Query, State, multipart::MultipartRejection,
         rejection::JsonRejection,
     },
     http::{StatusCode, header},
@@ -24,11 +24,17 @@ use tokio::sync::{Semaphore, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
+#[derive(Clone)]
+pub enum ServerEvent {
+    Image(String),
+    Deleted(Vec<String>),
+}
+
 pub const IMAGE_LIMIT: usize = 25 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<Mutex<Storage>>,
-    pub events: broadcast::Sender<String>,
+    pub events: broadcast::Sender<ServerEvent>,
     work: Arc<Semaphore>,
 }
 impl AppState {
@@ -128,7 +134,12 @@ pub fn router(state: AppState) -> Router {
             "/api/health",
             get(|| async { Json(json!({"status":"ok"})) }),
         )
-        .route("/api/images", get(list).post(upload))
+        .route("/api/images", get(list).post(upload).delete(clear_images))
+        .route("/api/images/prune", axum::routing::post(prune_images))
+        .route(
+            "/api/images/{image_id}",
+            axum::routing::delete(delete_image),
+        )
         .route("/api/current", get(current))
         .route("/api/events", get(events))
         .route("/api/images/{image_id}/content", get(content))
@@ -179,9 +190,20 @@ async fn static_file(uri: axum::http::Uri) -> Response {
 }
 async fn list(State(s): State<AppState>) -> Result<Json<Value>> {
     blocking(move || {
-        Ok(Json(
-            json!({"images":s.storage.lock().map_err(internal)?.data.images}),
-        ))
+        let store = s.storage.lock().map_err(internal)?;
+        let images = store
+            .data
+            .images
+            .iter()
+            .map(|m| {
+                let mut value = serde_json::to_value(m).map_err(internal)?;
+                value["size_bytes"] = json!(store.image_size(&m.id).map_err(internal)?);
+                value["annotation_count"] =
+                    json!(store.data.annotations.get(&m.id).map_or(0, Vec::len));
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Json(json!({"images":images})))
     })
     .await
 }
@@ -272,7 +294,7 @@ async fn upload(
             let _ = std::fs::remove_file(path);
             return Err(internal(e));
         }
-        let _ = s.events.send(meta.id.clone());
+        let _ = s.events.send(ServerEvent::Image(meta.id.clone()));
         Ok((StatusCode::CREATED, Json(meta)))
     })
     .await
@@ -521,10 +543,107 @@ async fn events(
     State(s): State<AppState>,
 ) -> Sse<impl futures_util::Stream<Item = std::result::Result<Event, Infallible>>> {
     let stream = BroadcastStream::new(s.events.subscribe()).map(|event| {
-        Ok(Event::default().event("image").data(match event {
-            Ok(id) => json!({"id":id}).to_string(),
-            Err(_) => "{}".into(),
-        }))
+        let (name, data) = match event {
+            Ok(ServerEvent::Image(id)) => ("image", json!({"id":id})),
+            Ok(ServerEvent::Deleted(ids)) => ("images_deleted", json!({"ids":ids})),
+            Err(_) => ("images_deleted", json!({})),
+        };
+        Ok(Event::default().event(name).data(data.to_string()))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn manage(
+    s: AppState,
+    options: crate::management::Selection,
+) -> Result<Json<crate::management::Report>> {
+    if let Some(ids) = &options.candidate_ids {
+        for value in ids {
+            id(value)?;
+        }
+    }
+    blocking(move || {
+        let report = s
+            .storage
+            .lock()
+            .map_err(internal)?
+            .select_and_delete(&options, chrono::Utc::now())
+            .map_err(internal)?;
+        if !report.deleted_ids.is_empty() {
+            let _ = s
+                .events
+                .send(ServerEvent::Deleted(report.deleted_ids.clone()));
+        }
+        Ok(Json(report))
+    })
+    .await
+}
+async fn prune_images(
+    State(s): State<AppState>,
+    body: std::result::Result<Json<crate::management::Selection>, JsonRejection>,
+) -> Result<Json<crate::management::Report>> {
+    let Json(options) = body.map_err(|e| bad(&e.body_text()))?;
+    if options.all
+        || (options.older_than_seconds.is_none() && options.keep_last.is_none())
+        || options
+            .older_than_seconds
+            .is_some_and(|n| n == 0 || n > i64::MAX as u64)
+    {
+        return Err(bad(
+            "Provide a positive older_than_seconds or keep_last; all is not allowed",
+        ));
+    }
+    manage(s, options).await
+}
+async fn clear_images(
+    State(s): State<AppState>,
+    body: std::result::Result<Json<crate::management::Selection>, JsonRejection>,
+) -> Result<Json<crate::management::Report>> {
+    let Json(options) = body.map_err(|e| bad(&e.body_text()))?;
+    if !options.all
+        || options.keep_last.is_some()
+        || options.older_than_seconds.is_some()
+        || options.include_annotated
+    {
+        return Err(bad("Clear requires all: true and no prune conditions"));
+    }
+    manage(s, options).await
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+async fn delete_image(
+    State(s): State<AppState>,
+    Path(image_id): Path<String>,
+    query: std::result::Result<Query<DeleteQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<crate::management::Report>> {
+    id(&image_id)?;
+    let Query(query) = query.map_err(|e| bad(&e.body_text()))?;
+    blocking(move || {
+        let mut store = s.storage.lock().map_err(internal)?;
+        if !store.data.images.iter().any(|m| m.id == image_id) {
+            return Err(missing());
+        }
+        let report = store
+            .select_and_delete(
+                &crate::management::Selection {
+                    all: true,
+                    dry_run: query.dry_run,
+                    candidate_ids: Some(vec![image_id]),
+                    ..Default::default()
+                },
+                chrono::Utc::now(),
+            )
+            .map_err(internal)?;
+        if !report.deleted_ids.is_empty() {
+            let _ = s
+                .events
+                .send(ServerEvent::Deleted(report.deleted_ids.clone()));
+        }
+        Ok(Json(report))
+    })
+    .await
 }

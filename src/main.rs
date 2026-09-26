@@ -1,3 +1,4 @@
+mod cli_management;
 use clap::{Parser, Subcommand};
 use markframe::{
     api::{AppState, IMAGE_LIMIT, router},
@@ -16,6 +17,34 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// List posted images, annotation counts and sizes.
+    List {
+        #[command(flatten)]
+        connection: cli_management::Connection,
+    },
+    /// Delete selected images and their annotations.
+    Delete {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+        #[command(flatten)]
+        options: cli_management::DeleteOptions,
+    },
+    /// Delete all posted images and annotations.
+    Clear {
+        #[command(flatten)]
+        options: cli_management::DeleteOptions,
+    },
+    /// Remove older images, preserving annotated images by default.
+    Prune {
+        #[arg(long, value_parser = cli_management::duration, required_unless_present = "keep_last")]
+        older_than: Option<u64>,
+        #[arg(long)]
+        keep_last: Option<usize>,
+        #[arg(long)]
+        include_annotated: bool,
+        #[command(flatten)]
+        options: cli_management::DeleteOptions,
+    },
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -37,6 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     match Cli::parse().command {
+        Command::List { connection } => cli_management::list(connection).await?,
+        Command::Delete { ids, options } => cli_management::delete(options, Some(ids), serde_json::json!({}), false).await?,
+        Command::Clear { options } => cli_management::delete(options, None, serde_json::json!({"all":true}), false).await?,
+        Command::Prune { older_than, keep_last, include_annotated, options } => cli_management::delete(options, None, serde_json::json!({"older_than_seconds":older_than,"keep_last":keep_last,"include_annotated":include_annotated}), true).await?,
         Command::Serve { host, port } => {
             let root = std::env::var_os("MARKFRAME_DATA_DIR")
                 .map(PathBuf::from)
